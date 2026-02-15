@@ -1,0 +1,205 @@
+# **Daily Batch Pipeline Design: PostgreSQL to BigQuery with Incremental Logic, Retries, and Cost Optimization**
+
+Below is a step-by-step design for a **reliable, cost-effective, and scalable** daily batch pipeline that ingests PostgreSQL data into BigQuery, leveraging **incremental loads, orchestration, retries, and real-time cost monitoring**.
+
+---
+
+## **1. Pipeline Overview**
+### **Data Source & Destination**
+- **Source:** PostgreSQL Database (assume 100M+ rows daily, needs incremental load)
+- **Destination:** BigQuery Star Schema (designed above)
+- **Batch Window:** Daily (e.g., 00:00 UTC–23:59 UTC)
+- **Incremental Logic:** Store `last_loaded_timestamp` in a pipeline metadata table.
+
+### **Pipeline Components**
+| Component                     | Tool/Technology               | Description                                                                                     |
+|------------------------------|------------------------------|-------------------------------------------------------------------------------------------------|
+| **Extractor**                | PostgresCDC / Debezium       | Uses **WAL (Write-Ahead Log) replication** to capture changes reliably.                          |
+| **Schema Registry**          | Cloud SQL Schema / Custom YAML | Tracks schema changes for Postgres → BigQuery compatibility                                 |
+| **Processing**               | Cloud Dataflow               | Uses Apache Beam templates for **efficient incremental reads, data transformations, and validation** |
+| **Sink**                     | BigQuery I/O (Pub/Sub)       | Partitioned, clustered tables to minimize costs and optimize queries                          |
+| **Orchestration**            | Dataflow with Airflow        | **Retries, error handling, and scheduling** (can use Batch/Dataflow templates).             |
+| **Cost Control**             | Dataflow SLAs + BIQ Cost API  | Monitor slot hours and costs in real-time during execution.                                |
+| **Metadata Storage**         | **`pipeline_metadata` Table** (BigQuery) | Tracks incremental loads and pipeline logs (e.g., `last_loaded_timestamp`, error counts).    |
+| **Testing**                  | Great Expectations, Unit Tests | Validate data quality before writing to BigQuery                                            |
+
+---
+
+## **2. Step-by-Step Pipeline Design**
+
+### **Step 0: Prerequisites**
+- **PostgreSQL CDB (Change Data Capture) Setup**
+  1. Enable **WAL replication** (if not already set up)
+  2. Create a **pub/sub topic** or **export to Cloud Storage** (for Dataflow ingestion)
+  3. Expose CDC data in a **debounce-window** (e.g., 1-minute debounce for real-time sync)
+
+- **Dataflow Template**
+  Define a custom Apache Beam template or use the **PostgreSQL to BigQuery** template.
+
+- **IAM Permissions**
+  Ensure Airflow/Dataflow has permissions to query, write to, and read from BigQuery/PostgreSQL.
+
+---
+
+### **Step 1: Data Extraction with Incremental Logic**
+#### **Goal**: Capture **only new or updated records** since last successful load.
+
+- **Source Options**:
+  1. **PostgresCDC (CDC)**:
+     ```python
+     class ExtractIncrementalEvents(Pipeline):
+         def __init__(self, pipeline_name, metadata_table, offset_timestamp):
+             super().__init__(pipeline_name=pipeline_name)
+
+             # Read last successfully loaded timestamp from metadata
+             last_loaded_timestamp = self.query_metadata(metadata_table)
+
+             # Use PostgresCDC to read events from offset_timestamp to the end of the water (current CDC time)
+             self.extract = PostgresCDCIO.read(
+                 host='your-postgres-host',
+                 credentials={...},
+                 topic_project_id='your-topic-project',
+                 schema='events'
+             ).with_window(start=offset_timestamp, end=current_CDC_time)
+
+             # Write to BigQuery as a temporary load staging table
+             self.write_extract = DataflowWriteToBigQuery(
+                 table=f"{target_project}.ecommerce._staging.events_{offset_timestamp}",
+                 write_disposition=BigQueryWrite.DISPOSITION.WRITE_APPEND,
+                 schema=get_postgres_schema()
+             )
+
+             self.run()
+     ```
+  2. **Alternative (If CDC not possible)**:
+     Use the **`last_event_id`** strategy with a **PostgresCursor**:
+     ```python
+     with PostgresCursor() as cursor:
+         cursor.execute(
+             """
+             SELECT * FROM events
+             WHERE updated_at > '{}'  -- Incremental logic
+             AND event_timestamp IS NOT NULL
+             AND event_type IN ('session_start', 'mobile_app_open', 'product_view', 'purchase')
+             AND exclude_test_user(user_id)  -- Exclude test users to reduce redundancy
+             """.format(last_loaded_timestamp)
+         )
+         yield cursor.fetch_batch()
+     ```
+
+- **Output**: Data streamed to **BigQuery `_staging` table** with timestamp-based suffix (prevents table conflicts).
+  ```sql
+  -- Create a partitioning-clustering optimized table to hold daily events
+  CREATE TABLE your_project.ecommerce._staging.daily_events (
+      event_id STRING,
+      event_timestamp TIMESTAMP,
+      user_id STRING,
+      event_type STRING,
+      event_properties JSON
+  )
+  PARTITION BY DATE(event_timestamp)
+  CLUSTER BY user_id, event_type;
+  ```
+
+---
+
+### **Step 2: Data Validation & Quality Checks (Dataflow)**
+#### **Purpose**: Ensure **no corruption, data consistency.**
+
+1. **Schema Validation**:
+   ```python
+   | 'Extract' >> Beam.Map(
+       lambda row: row,  # Ensure raw Postgres rows match our schema
+       validate_schema=get_bq_schema("your_project.ecommerce._staging.daily_events")
+   )
+   ```
+
+2. **Field Presence Checks**:
+   ```python
+   | 'CheckNonNulls' >> Beam.Map(
+       lambda row: {
+           "error": f"{row} has NULL values for REQUIRED fields"
+       } if any([isNone(row[col]) for col in ["user_id", "event_timestamp"]]),
+       else_=row
+   )
+   ```
+
+3. **Data Distribution (Null/Empty Check)**:
+   ```python
+   | 'WriteValidation' >> Beam.io.WriteToBigQuery(
+       table=your_project.ecommerce._validated.events_validation,
+       rows_quota=0,  # Disable quota enforcement for validation
+       schema=get_schema(),
+       create_disposition="CREATE_IF_NEEDED"
+   )
+   ```
+
+- **Output**: A **data validation report** written to a separate table.
+
+---
+
+### **Step 3: Incremental Data Loading (PostgreSQL → BigQuery)**
+#### **Goal**: Merge new records into BigQuery incrementally with **cost-conscious writes**, preventing overload.
+
+1. Use **Dataflow’s `BigQueryIO`** to write **exactly once**:
+   ```python
+   def incremental_dataflow_transform(events):
+       def update_pipeline_metadata(**metadata):
+           """Helper to update BigQuery metadata"""
+           ...
+
+       with Beam.Map(update_pipeline_metadata)(last_loaded_ts=datetime.now().replace(MINUTE, SECOND, DAY=current_day)) and
+
+       # Incremental MERGE pattern (avoids full load)
+       | 'GroupById' >> events | {'GroupById': events} | Beam.GroupByKey() \*  # Pre-group by PK
+       | 'PartitionByLoadDate' >> Beam.FlatMap(
+           process_large_batch_group_by_key,
+           max_batch_size=10_000,  # Control slot consumption
+           max_worker_concurrency=500,
+       ),
+
+       | 'MergeIntoFact' >> BigQueryIO.merge(
+           table=your_project.ecommerce.fct_events,
+           schema=schema,
+           time_partitioning=get_partitioning(),
+           row_selection=row_selection(primary_key="user_id, event_timestamp"),
+           insert_keys=get_key_mapping(),
+       )
+       """
+
+       # Execute the transform
+       p = Beam.Pipeline()
+       p | events | ... | 'MergeIntoFact' >>
+       p.run(transform_fn() and update_metadata())
+   ```
+
+#### **BigQuery MERGE Statement Example**:
+```sql
+MERGE `your_project.ecommerce.fct_events` T
+USING `your_project.ecommerce._staging.daily_events_incremental` S
+ON (T.user_id = S.user_id)
+    AND (T.event_timestamp = S.event_timestamp)
+WHEN MATCHED AND NOT T.is_active = S.is_active  -- Only update active flags
+    THEN UPDATE SET is_active = S.is_active, event_properties = S.event_properties
+WHEN NOT MATCHED  -- Ingest new events as incremental
+    THEN INSERT (user_id, event_timestamp, event_properties, is_active)
+    VALUES (S.user_id, S.event_timestamp, S.event_properties, S.is_active);
+```
+
+---
+
+### **Step 4: Orchestration with Retries & Cost Control**
+#### **Goal**: Ensure **self-healing pipeline, cost alerts** (e.g., if slot hours run dry).
+
+- **Setup Airflow DAG (Python)** for Dataflow Orchestration:
+```python
+from airflow import DAG
+from airflow.contrib.operators.dataflow_operator import DataflowTemplateStartOperator
+from airflow.providers.google.cloud.hooks.cloud_scheduler import CloudSchedulerHook
+from datetime import timedelta
+
+def generate_retries(pipeline_name):
+    """Trigger retry based on Airflow context"""
+    with CloudSchedulerHook(project_id="your_project").check_pipeline_status(pipeline_name=template_path) as response:
+        if response["response"]["statusState"] == "FAILURE":
+            dag_run.context["execution_date"] =

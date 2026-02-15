@@ -1,0 +1,104 @@
+Task 2 — Design a star schema for an e-commerce analytics warehouse
+# **E-Commerce Analytics Star Schema Design**
+
+This star schema is designed for a scalable, analytical-based e-commerce warehouse in **BigQuery**, addressing key KPIs such as **Daily Active Users (DAU), Monthly Active Users (MAU), Week Active Users (WAU), session behavior, cart progression, conversions, retention, and revenue analysis**. The schema minimizes redundancy, leverages indexing capabilities (partitioning/clustering in BigQuery), and optimizes for common analytical query patterns.
+
+---
+
+## **Core Star Schema for E-Commerce Analytics**
+### **Fact Tables**
+#### **1. `fct_events`**
+- **Grain:** Event-level (single row per user event)
+- **Keys:**
+  - `event_timestamp` (timestamp, partitioned and clustered)
+  - `event_id` (surrogate key, UUID)
+  - `user_dim.user_id` (foreign key)
+  - `device_dim.device_id` (foreign key)
+  - `geo_dim.location_id` (foreign key)
+
+| Column                    | Type          | Description                                                                                     | Notes                                                                                         |
+|---------------------------|---------------|-------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| `event_id`               | STRING        | Unique identifier for the event (partitioning key)                                               | UUID/v4 generated during ingestion                                                    |
+| `event_timestamp`        | TIMESTAMP     | When the event occurred (clustering/surrogate key)                                           | `PARTITION BY DATE(event_timestamp)` `CLUSTER BY user_id, device_type`              |
+| `user_id`               | STRING        | User identifier (FK to `user_dim`)                                                           | `NOT NULL`                                                                                 |
+| `device_id`             | INT64         | Device identifier (FK to `device_dim`)                                                         | `NOT NULL`; includes mobile/web/app                                                            |
+| `session_id`            | STRING        | Unique session identifier (FK to `fct_sessions`)                                             | `NULL` for non-session events                                                           |
+| `event_type`            | STRING        | Type of event (e.g., 'page_view', 'add_to_cart', 'purchase', 'search', 'session_start', 'impression') | Denormalized for performance; used in dimension flags                                  |
+| `event_properties`      | RECORD        | JSON structure of all relevant event properties (e.g., page URL, product SKU, offer, etc.)           | Used as-is in calculations to avoid pre-embedding values; can be expanded via CTEs  |
+| `referrer_id`           | INT64         | ID of referrer channel (e.g., social media, email campaign, organic search) (FK to `geo_dim`) | `NULL` if not applicable                                                                     |
+| `is_conversion`        | BOOL          | Flag indicating if event belongs to a conversion funnel (e.g., 'purchase')                        |                                                                                              |
+| `is_transaction`      | BOOL          | Flag indicating if event represents a revenue event (e.g., 'checkout')                          |                                                                                              |
+
+**Purpose:**
+Traces user interactions across all touchpoints (web, mobile app, and emails). This fact table drives metrics such as DAU, WAU, MAU, funnel analysis, and behavioral segmentation.
+
+---
+
+#### **2. `fct_products`**
+- **Grain:** Product variant (each row represents a unique cart/listing/purchase combination)
+- **Keys:**
+  - `product_usage_timestamp` (timestamp, partitioned)
+  - `user_dim.user_id` (foreign key)
+  - `product_catalog_dim.sku_id` or `product_catalog_dim.product_id` (foreign key)
+
+| Column                               | Type       | Description                                                                                     | Notes                                                                                         |
+|--------------------------------------|------------|-------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| `product_usage_id`                  | STRING     | Surrogate key for the row (UUID)                                                                |                                                                                              |
+| `product_usage_timestamp`           | TIMESTAMP  | When the product was added to cart, viewed, or purchased (partitioned)                               | `PARTITION BY DATE(product_usage_timestamp), CLUSTER BY user_id, sku_id`             |
+| `user_id`                          | STRING     | User identifier (FK to `user_dim`)                                                           | `NOT NULL`                                                                                 |
+| `product_id`                       | STRING     | Referenced product ID (FK to `product_catalog_dim`)                                            | Product base ID (e.g., 'ABC123')                                                       |
+| `sku_id`                           | STRING     | Referenced SKU ID                                                                              | More granular (e.g., 'ABC123_blue_small'); used for product variants                      |
+| `category_id`                      | INT64      | Product category (FK to `product_category_dim`)                                             | Used for segmentation                                                                  |
+| `price_at_usage`                    | NUMERIC   | Price when this product was interacted with                                                      | Stores value as **NUMERIC** for high precision                                                    |
+| `quantity_sold`                    | INT64     | Product quantity during usage (0 for views, 1+ for purchases/orders)                           | `0` if only viewing; `1` for one-off purchases                                               |
+| `order_id`                         | STRING     | Order identifier (FK to `fct_orders`)                                                       | Order details at the time of sale                                                                |
+| `user_agent_id`                    | INT64     | Device/browser identifier (FK to `device_dim`)                                               | Segment by user agent                                                                  |
+| `page_id`                         | INT64     | Web page identifier (e.g., listing page) (fk to `page_dim`)                                   | Useful for page-level segmentation                                                          |
+| `is_refunded`                     | BOOL      | Indicates if product was purchased and later refunded (0/1)                                        | Used for net purchase metrics                                                         |
+
+**Purpose:**
+Tracks all product interactions (views, carts, purchases) at a detailed level. Powers revenue analysis, conversion rates by product, and cart abandonment metrics.
+
+---
+
+#### **3. `fct_orders`**
+- **Grain:** Order line-item (each cart line item is stored with order details)
+- **Keys:**
+  - `order_timestamp` (timestamp)
+  - `user_id` (foreign key)
+  - `order_id` (surrogate key)
+  - `fct_products.product_usage_id` + `fct_products.sku_id` (referencing)
+
+| Column                     | Type          | Description                                                                                     | Notes                                                                                         |
+|----------------------------|---------------|-------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| `order_id`               | STRING        | Surrogate key (UUID)                                                                           |                                                                                              |
+| `order_timestamp`        | TIMESTAMP     | When order was placed                                                                          | `PARTITION BY DATE(order_timestamp)`` CLUSTER BY user_id, order_id`                               |
+| `user_id`               | STRING        | User identifier (FK to `user_dim`)                                                           | `NOT NULL`                                                                                 |
+| `customer_id`           | INT64         | Unique customer identifier (e.g., loyalty program)                                         | `NULL` if not member                                                                       |
+| `product_id`           | STRING        | Ordered product ID (FK to `product_catalog_dim`)                                            |                                                                                              |
+| `sku_id`               | STRING        | Ordered SKU ID (FK to `product_catalog_dim`)                                                | Includes variant attributes (size, color, etc.)                                            |
+| `quantity`             | INT64         | Quantity ordered                                                                             |                                                                                              |
+| `unit_price`           | NUMERIC      | Unit price of the item at the time of purchase                                                | High precision necessary for revenue calculations                                            |
+| `total_price`          | NUMERIC      | Line-item total price (pre-tax)                                                            | `total_price = unit_price * quantity` (computed)                                             |
+| `discount_value`       | NUMERIC      | Total discount applied to this line item                                                      | Used in revenue analysis (gross/Net metrics)                                               |
+| `tax_value`           | NUMERIC      | Tax value for this line item                                                                | Can filter to no-tax regions for simpler gross revenue analysis                                 |
+| `shipping_value`      | NUMERIC      | Shipping cost allocated to this line item                                                     | Critical for cost segmenting                                                                   |
+| `payment_method_id`  | INT64         | Method of payment used (FK to `fct_payments`)                                               | Group revenue by payment type                                                               |
+| `status`              | STRING        | Order status (e.g., 'pending', 'shipped', 'cancelled', 'refunded')                             | Useful for calculating gross-to-net conversion                                               |
+| `currency_id`        | INT64         | Currency type (FK to `currency_dim`)                                                        | Track revenue in different currencies                                                           |
+| `is_guest`           | BOOL          | Indicates if the order was placed by a guest (non-registered user)                             | Used in retention analysis                                                                    |
+| `fulfillment_details` | RECORD        | Date/shipped status/return details                                                         |                                                                                              |
+
+**Purpose:**
+Contains all line-item order data, enabling **gross revenue, net revenue, order size segmentation, and funnel analysis up to checkout completion**.
+
+---
+
+#### **4. `fct_payments`** (Additional Fact Table for Order Splits)
+- **Keys:**
+  - `order_id` (foreign key)
+  - `payment_method_id` (foreign key)
+
+| Column                         | Type          | Description                                                                                     | Notes                                                                                         |
+|-------------------------------|---------------|-------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| `payment_timestamp`           | TIMESTAMP

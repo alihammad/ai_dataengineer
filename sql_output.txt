@@ -1,0 +1,155 @@
+Task 1 — Write a BigQuery SQL query to calculate daily active users from an events table
+# BigQuery SQL Query for Daily Active Users (DAU) Calculation
+
+Based on your request to calculate daily active users (DAU) from an events table, here's a comprehensive, optimized BigQuery SQL solution with explanations:
+
+```sql
+-- Daily Active Users (DAU) calculation with nested analytics approach
+-- Optimized for both performance and cost by filtering early and using APPROX_COUNT_DISTINCT
+WITH
+-- First narrow down the users to those with at least one event per day
+daily_active_user_events AS (
+  -- We use a window function to identify any user that has at least one event per day
+  SELECT
+    user_id,
+    DATE(event_timestamp) AS event_date
+  FROM
+    `project_dataset.events`
+  WHERE
+    event_type IN ('mobile_app_open', 'web_app_open', 'session_start', 'transaction')
+    -- Filter to only active events to improve performance
+    AND event_status = 'success'
+    -- Exclude test accounts (cost optimization)
+    AND user_id NOT IN ('test_user_1', 'test_user_2', [LIST_OTHER_TEST_USER_IDS])
+),
+
+-- For each user date pair, mark if they're active on that day
+user_daily_activity AS (
+  SELECT
+    user_id,
+    event_date,
+    -- Mark as active with a simple constant
+    1 AS is_active
+  FROM
+    daily_active_user_events
+),
+
+-- Calculate DAU using APPROX_COUNT_DISTINCT for better performance with large result sets
+dau_per_day AS (
+  SELECT
+    event_date,
+    APPROX_COUNT_DISTINCT(user_id) AS dau_count
+    -- This approximation reduces exactness slightly but significantly improves performance
+    -- and cost when dealing with hundreds of millions or billions of distinct users
+  FROM
+    user_daily_activity
+  GROUP BY
+    event_date
+)
+
+-- Final result with date ranges for analysis
+SELECT
+  DATE_TRUNC(ORDER_DATE, DAY) AS order_date,
+  dau_event_date.dau_count AS dau_count,
+
+  -- Common DAU analysis metrics
+  CASE
+    WHEN DATE_DIFF(dau_event_date.event_date, DATE_TRUNC(ORDER_DATE, DAY), DAY) = 0
+    THEN dau_event_date.dau_count
+    ELSE NULL
+  END AS current_day_dau,
+
+  -- 7-day rolling DAU for trend analysis
+  (
+    SELECT SUM(dau_count)
+    FROM dau_per_day
+    WHERE DATE_DIFF(event_date, DATE_TRUNC(ORDER_DATE, DAY), DAY) BETWEEN 1 AND 7
+    AND event_date <= DATE_TRUNC(ORDER_DATE, DAY)
+  ) AS seven_day_rolling_dau,
+
+  -- 30-day rolling DAU for longer-term trends
+  (
+    SELECT SUM(dau_count)
+    FROM dau_per_day
+    WHERE DATE_DIFF(event_date, DATE_TRUNC(ORDER_DATE, DAY), DAY) BETWEEN 1 AND 30
+    AND event_date <= DATE_TRUNC(ORDER_DATE, DAY)
+  ) AS thirty_day_rolling_dau,
+
+  -- Daily change (optimized with LAG)
+  LAG(dau_count) OVER (ORDER BY order_date) AS previous_day_dau,
+  (dau_count - LAG(dau_count) OVER (ORDER BY order_date)) /
+    NULLIF(LAG(dau_count) OVER (ORDER BY order_date), 0) AS day_over_day_change_pct,
+FROM
+  dau_per_day AS dau_event_date
+CROSS JOIN
+  UNNEST(ARRAY(
+    SELECT order_date
+    FROM UNNEST(GENERATE_DATE_ARRAY(
+      MIN(dau_per_day.event_date),
+      MAX(dau_per_day.event_date),
+      INTERVAL 1 DAY
+    )) AS order_date
+  )) WITH OFFSET AS offset_info
+-- Join with date range to get metrics for all dates in our result set
+LEFT JOIN
+  (SELECT order_date - INTERVAL o OFFSET DAY) AS time_dimension
+-- Optimized view that calculates the dates once
+WHERE
+  time_dimension.event_date BETWEEN MIN(event_date) AND MAX(event_date)
+  -- Additional partitioning by date for potentially improved performance
+  AND event_date IS NOT NULL
+ORDER BY
+  order_date;
+```
+
+## Explanation of the Optimized Query:
+
+### 1. **Table and Column Assumptions**:
+   - `project_dataset.events` contains event data with:
+     - `user_id` (string/INT64) identifying users
+     - `event_timestamp` (TIMESTAMP) with the precise time of each event
+     - `event_type` indicating types of user activity we should measure
+     - `event_status` to filter out unsuccessful events (cost/performance optimization)
+   - You need to specify your project_dataset name and include any test user IDs you want to exclude
+   - You may want to adjust the `event_type` filters based on your definition of "activity"
+
+### 2. **Query Structure**:
+   - **Step 1 (`daily_active_user_events`)**: Filters the raw event table to only include relevant active events and extracts date from timestamp
+     - Early filtering with `event_type IN` and `event_status = 'success'` reduces the data processed
+     - Test user exclusion is particularly impactful if your events table has many test events
+
+   - **Step 2 (`user_daily_activity`)**: Simplifies the data to just user-date pairs where active
+     - Converts to user-day boolean flag (is_active = 1) which is more efficient for counting
+
+   - **Step 3 (`dau_per_day`)**: The core counting logic using `APPROX_COUNT_DISTINCT`
+     - Instead of exact `COUNT(DISTINCT())` which scans all values, this approximation significantly reduces cost
+     - For exact DAU counts, you could replace with `COUNT(DISTINCT(user_id))` but expect higher costs
+
+   - **Final SELECT**: Calculates multiple common DAU metrics including:
+     - Current day DAU
+     - 7-day and 30-day rolling averages (critical for trend analysis)
+     - Day-over-day percentage change using window function LAG pattern
+
+### 3. **Performance Optimizations**:
+   - **APPROX functions**: Allows accurate counting while reducing cost
+   - **Window functions**: Efficient calculation of DAU metrics using analytical operations
+   - **Early filtering**: Reduces bytes processed with WHERE clauses before JOIN operations
+   - No unnecessary string/JSON operations
+
+### 4. **Cost Optimizations**:
+   - Exclusion of test users prevents counting test activity in production metrics
+   - APPROX functions reduce bytes processed compared to exact distinct counts
+   - The query returns metrics for all dates in a single pass with date range generation
+
+### 5. **Error Handling**:
+   - `NULLIF` prevents division by zero errors in day-over-day calculations
+   - Explicit handling of NULL values in time series calculations
+
+### Important Notes:
+1. This assumes your events timestamp spans the entire date range you want to analyze
+2. For large date ranges, you may want to pre-filter with a `DATE_BETWEEN` clause in the first CTE
+3. If you need exact counts rather than approximations, replace `APPROX_COUNT_DISTINCT` with `COUNT(DISTINCT())`
+4. The query will show NULL for days where no events occurred
+5. Be sure to test with your specific schema and check job execution details for any adjustments
+
+The query pattern can be easily adapted to calculate additional metrics like MAU, WAU, or DAU cohorts. Would you like me to add any of those additional calculations?
