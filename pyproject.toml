@@ -1,0 +1,12 @@
+[project]
+name = "ai-dataengineer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "crewai==1.9.3",
+    "litellm==1.31.14",
+    "fastapi",
+    "requests",
+]
